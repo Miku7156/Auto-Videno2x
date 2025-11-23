@@ -1,0 +1,20 @@
+# Auto-Videno2x 依赖文件
+# Python版本要求: 3.6及以上
+
+# 本项目主要使用Python标准库，无需安装额外的第三方依赖
+# 使用的标准库包括:
+# - os: 用于文件和目录操作
+# - subprocess: 用于执行外部命令（如Video2X和GPU检查）
+# - configparser: 用于读取和解析配置文件
+# - sys: 用于系统相关操作
+# - time: 用于时间测量
+# - logging: 用于日志记录
+# - json: 用于数据序列化和反序列化
+# - datetime: 用于日期和时间处理
+# - re: 用于正则表达式操作
+# - shutil: 用于高级文件操作
+# - collections: 用于特殊数据结构（如defaultdict）
+
+# 注意: 项目依赖外部工具:
+# - Video2X: 用于视频质量增强
+# - NVIDIA驱动(nvidia-smi): 可选，用于GPU占用度检查
