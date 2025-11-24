@@ -4,11 +4,14 @@ import configparser
 import sys
 import time
 import logging
-import configparser
 import json 
 from datetime import datetime, timedelta
 import re
 import shutil
+from collections import defaultdict
+import threading
+import time
+            
 
 # 视频文件扩展名集合
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.m4v', '.mpeg', '.mpg', '.ts', '.webm', '.vob', '.ogv', '.rmvb', '.asf', '.rm', '.3gp'}
@@ -20,7 +23,8 @@ VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.m4v', '.mp
 def get_base_dir():
     """获取基础目录，兼容PyInstaller打包后的环境"""
     if hasattr(sys, '_MEIPASS'):
-        return sys._MEIPASS
+        # 打包后返回exe所在目录
+        return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 BASE_DIR = get_base_dir()
@@ -129,7 +133,7 @@ try:
                 # 从文件名中提取 季度(S01) 和 集数(E06)
                 season_match = re.search(r'S(\d{2})E(\d{2,4})', filename_with_ext, re.IGNORECASE)
                 season = "00"  # 默认值
-                episode = "00"  # 默认值
+                episode = "0000"  # 默认值
 
                 if season_match:
                     season = season_match.group(1)  # 如 '01'
@@ -162,9 +166,6 @@ try:
         if dir_path not in dir_groups:
             dir_groups[dir_path] = []
         dir_groups[dir_path].append(file)
-
-    # 导入必要的库
-    from collections import defaultdict
 
     # 计算字符串相似度 (Levenshtein距离)
     def levenshtein_distance(s1, s2):
@@ -208,8 +209,7 @@ try:
     for dir_path, files in dir_groups.items():
         # 1. 文件归类 (分支)
         branches = []
-        ungrouped = files.copy()
-
+        ungrouped = [file for file in files if "Viden2x_HQ" not in file["文件完整路径"]]
         while ungrouped:
             current_file = ungrouped.pop(0)
             current_group = [current_file]
@@ -233,7 +233,11 @@ try:
                     continue
 
                 # 检查文件名相似度
-                distance = levenshtein_distance(current_name, name)
+                # 移除文件名中的季度和集数信息 (SxxExx格式)
+                pattern = re.compile(r'S\d{2,}E\d{2,}', re.IGNORECASE)
+                cleaned_current = pattern.sub('', current_name)
+                cleaned_name = pattern.sub('', name) 
+                distance = levenshtein_distance(cleaned_current, cleaned_name)
                 similarity = 1 - (distance / max(len(current_name), len(name)))
                 if similarity > 0.6:
                     current_group.append(file)
@@ -278,7 +282,6 @@ try:
                         best_branch = candidate_branch
                 # 将小分支合并到最佳匹配的大分支（不设置相似度阈值）
                 # 无条件合并到最相似的大分支
-                
                 branch_id = new_branches.index(best_branch)
 
                 for file in small_branch:
@@ -292,43 +295,45 @@ try:
         # 2.1 收集所有季度和集数组合
         all_episodes = set()
         for file in files:
-            if file["季度信息"] != "00" and file["集数信息"] != "0000":
+            if file["季度信息"] != "00" and file["集数信息"] != "00":
                 all_episodes.add((file["季度信息"], file["集数信息"]))
 
         # 2.2 计算每个分支的文件大小总和
         branch_sizes = defaultdict(int)
         for branch_id, branch_files in enumerate(branches):
             total_size = 0
-    seen_episodes = set()
-    for file in branch_files:
-        # 排除包含Viden2x_HQ的文件
-        if "Viden2x_HQ" in file["文件名带扩展名"]:
-            continue
-        episode_key = (file["季度信息"], file["集数信息"])
-        # 只计算在所有分支中都存在的季度和集数，且每个集数只计算一次
-        if episode_key in all_episodes and episode_key not in seen_episodes:
-            # 检查该季度和集数是否存在于所有分支
-            exists_in_all = True
-            for check_branch_id in range(len(branches)):
-                if check_branch_id == branch_id:
+            seen_episodes = set()
+            for file in branch_files:
+                # 排除包含Viden2x_HQ的文件
+                if "Viden2x_HQ" in file["文件名带扩展名"]:
                     continue
-                found = False
-                for check_file in branches[check_branch_id]:
-                    if (check_file["季度信息"], check_file["集数信息"]) == episode_key:
-                        found = True
-                        break
-                if not found:
-                    exists_in_all = False
-                    break
-            if exists_in_all:
-                total_size += file["文件大小 (字节)"]
-                seen_episodes.add(episode_key)
-            branch_sizes[branch_id] = total_size
+                episode_key = (file["季度信息"], file["集数信息"])
+                # 只计算在所有分支中都存在的季度和集数，且每个集数只计算一次
+                if episode_key in all_episodes and episode_key not in seen_episodes:
+                    # 检查该季度和集数是否存在于所有分支
+                    exists_in_all = True
+                    for check_branch_id in range(len(branches)):
+                        if check_branch_id == branch_id:
+                            continue
+                        found = False
+                        for check_file in branches[check_branch_id]:
+                            if (check_file["季度信息"], check_file["集数信息"]) == episode_key:
+                                found = True
+                                break
+                        if not found:
+                            exists_in_all = False
+                            break
+                    if exists_in_all:
+                        total_size += file["文件大小 (字节)"]
+                        seen_episodes.add(episode_key)
+                    branch_sizes[branch_id] = total_size
 
         # 2.3 按大小排序分支并分配优先级
         # 创建分支ID到索引的映射，提高查找效率
         branch_index_map = {id(branch): idx for idx, branch in enumerate(branches)}
-        sorted_branches = sorted(branches, key=lambda x: branch_sizes[branch_index_map[id(x)]])
+        # 过滤掉分支级为-1的分支
+        filtered_branches = [branch for branch in branches if all(file["分支"] != -1 for file in branch)]
+        sorted_branches = sorted(filtered_branches, key=lambda x: branch_sizes[branch_index_map[id(x)]])
         for priority, branch in enumerate(sorted_branches):
             for file in branch:
                 file["处理优先级"] = priority
@@ -371,15 +376,25 @@ try:
     # 筛选6天内更新且处理优先级==0、处理步骤==0的文件，标记处理步骤为1（已筛选）
     current_time = datetime.now()
     six_days_ago = current_time - timedelta(days=6)
+    filtered_count = 0
+    filtered_files = []
     for file in file_data_list:
         if file.get("处理优先级") == 0 and file.get("处理步骤") == 0:
             try:
                 modify_time = datetime.strptime(file["文件修改时间"], '%Y-%m-%d %H:%M:%S')
                 if modify_time >= six_days_ago:
                     file["处理步骤"] = 1  # 标记为已筛选
+                    filtered_count += 1
+                    filtered_files.append(file["文件完整路径"])
             except ValueError:
                 logger.warning(f"无法解析文件修改时间: {file['文件修改时间']}")
+    # 输出筛选结果统计
+    logger.info(f"筛选出 {filtered_count} 个符合条件的文件:")
+    for file_path in filtered_files:
+        logger.info(f"- {file_path}")
     
+    # 读取分辨率增强倍数配置
+    res_multiplier = config.get('Video', 'res_multiplier', fallback='2')
     # 开始画面增强处理
     # 检查是否在允许的时间范围内执行
     allowed_days = config.get('Schedule', 'AllowedDays', fallback='1-7')
@@ -391,13 +406,12 @@ try:
         # 保存数据
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-        logger.info(f"💾 结果已保存到: {output_json_path}")
+        logger.info("💾 结果已保存到: %s", output_json_path)
         sys.exit(0)
     
     # 检查GPU占用度
     gpu_threshold = config.getint('Schedule', 'GpuUsageThreshold', fallback=80)
     try:
-        import subprocess
         result = subprocess.run(
             ['nvidia-smi', '--query-gpu=utilization.gpu', '--format=csv,noheader,nounits'],
             capture_output=True, text=True, check=True
@@ -407,9 +421,10 @@ try:
 
         if gpu_usage > gpu_threshold:
             logger.info(f"GPU占用度 {gpu_usage}% 超过阈值 {gpu_threshold}%，保存数据并退出程序")
+            # 保存数据
             with open(output_json_path, 'w', encoding='utf-8') as f:
                 json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-            logger.info(f"💾 结果已保存到: {output_json_path}")
+            logger.info("💾 结果已保存到: %s", output_json_path)
             sys.exit(0)
     except subprocess.CalledProcessError as e:
         logger.warning(f"获取GPU使用率失败: {e}，将继续执行程序")
@@ -423,6 +438,17 @@ try:
             filename = os.path.basename(input_path)
             output_path = os.path.join(tmp_dir, filename)
             logger.info(f"开始增强画面: {input_path}")
+            # 显示加载动画
+            def loading_animation(stop_event):
+                while not stop_event.is_set():
+                    for char in '|/-\ ':
+                        print(f'\r正在增强画面中... {char}', end='', flush=True)
+                        time.sleep(0.1)
+                print('\r增强画面完成!        ', flush=True)
+            
+            stop_event = threading.Event()
+            loading_thread = threading.Thread(target=loading_animation, args=(stop_event,))
+            loading_thread.start()
             try:
                 start_time = time.time()
                 subprocess.run([
@@ -433,16 +459,22 @@ try:
                     '-h', res_height,
                     '-p', res_processor,
                     '--libplacebo-shader', res_shader
-                ],capture_output=True, check=True)
+                ], capture_output=True, text=True)
                 end_time = time.time()
                 duration = end_time - start_time
                 logger.info(f"画面增强完成:{output_path},耗时: {duration:.2f}秒")
                 file['处理步骤'] = 2  # 标记为已增强
+                #保存数据
+                with open(output_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(file_data_list, f, ensure_ascii=False, indent=2)
+                logger.info("💾 结果已保存到: %s", output_json_path)
             except subprocess.CalledProcessError as e:
                 logger.error(f"处理文件 {input_path} 失败: {e}")
+            finally:
+                stop_event.set()
+                loading_thread.join()
 
-    # 帧率增强处理：处理步骤=2的文件
-    for file in file_data_list:
+        # 帧率增强处理：处理步骤=2的文件
         if file.get('处理步骤') == 2:
             input_filename = os.path.basename(file['文件完整路径'])
             input_path = os.path.join(tmp_dir, input_filename)
@@ -460,7 +492,16 @@ try:
             try:
                 logger.info(f"开始帧率增强: {input_path}")
                 start_time = time.time()
-                
+                # 显示加载动画
+                def loading_animation(stop_event):
+                    while not stop_event.is_set():
+                        for char in '|/-\ ':
+                            print(f'\r正在增强帧率中... {char}', end='', flush=True)
+                            time.sleep(0.1)
+                    print('\r增强帧率完成!        ', flush=True)
+                stop_event = threading.Event()
+                loading_thread = threading.Thread(target=loading_animation, args=(stop_event,))
+                loading_thread.start()
                 # 执行video2x帧率增强命令
                 # 添加详细日志和错误捕获
                 result = subprocess.run([
@@ -472,12 +513,10 @@ try:
                     '-p', frame_processor,
                     '--rife-model', rife_model,
                 ], capture_output=True, text=True)
-                
                 # 处理输出内容，区分GPU信息和错误
                 stderr_lines = result.stderr.splitlines()
                 gpu_lines = [line for line in stderr_lines if '[0 NVIDIA GeForce' in line]
                 non_gpu_lines = [line for line in stderr_lines if '[0 NVIDIA GeForce' not in line and line.strip()]
-                
                 # 检查命令执行结果
                 if result.returncode == 0:
                     # 命令成功执行
@@ -485,6 +524,8 @@ try:
                         logger.warning(f"帧率增强成功但存在输出: {chr(10).join(non_gpu_lines)}")
                     # 计算处理时间
                     end_time = time.time()
+                    stop_event.set()
+                    loading_thread.join()
                     duration = end_time - start_time
                     logger.info(f"帧率增强完成:{output_path},耗时: {duration:.2f}秒")
                     file['处理步骤'] = 3    #标记为已执行完全部处理
@@ -499,7 +540,6 @@ try:
                             shutil.move(output_path, target_path)
                             logger.info(f"帧率增强文件已移动至: {target_path}")
                             # 更新文件记录路径和处理状态
-                            file['文件完整路径'] = target_path
                             file['处理步骤'] = 3  # 标记为已完成所有处理
                             # 清理临时画面增强文件
                             if os.path.exists(input_path):
@@ -530,7 +570,6 @@ try:
                                 shutil.move(output_path, target_path)
                                 logger.info(f"帧率增强文件已移动至: {target_path}")
                                 # 更新文件记录路径和处理状态
-                                file['文件完整路径'] = target_path
                                 file['处理步骤'] = 3  # 标记为已完成所有处理
                                 # 清理临时画面增强文件
                                 if os.path.exists(input_path):
@@ -558,6 +597,10 @@ try:
             except Exception as e:
                 logger.error(f"帧率增强发生异常: {str(e)}")
 
+            finally:
+                stop_event.set()
+                loading_thread.join()
+    #保存数据
     with open(output_json_path, 'w', encoding='utf-8') as f:
         json.dump(file_data_list, f, ensure_ascii=False, indent=2)
     logger.info("💾 结果已保存到: %s", output_json_path)
@@ -565,11 +608,11 @@ try:
     auto_shutdown = config.getboolean('Schedule', 'AutoShutdown', fallback=False)
     if auto_shutdown:
         logger.info("所有任务已完成，准备关闭电脑...")
-        import subprocess
         subprocess.run(["powershell", "Stop-Computer", "-Force"])
         sys.exit(0)
     else:
         logger.info("所有任务已完成，自动关机功能已禁用")
+        sys.exit(0)
 
 except Exception as e:
     logger.critical("💥 扫描过程中发生严重错误: %s", e, exc_info=True)
