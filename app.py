@@ -561,8 +561,6 @@ try:
                 last_input_time = win32api.GetLastInputInfo()
                 elapsed_seconds = (win32api.GetTickCount() - last_input_time) / 1000
                 result = datetime.now() - timedelta(seconds=elapsed_seconds)
-                # 调试信息：输出获取到的输入时间
-                logger.debug(f"获取到最后输入时间: {result}, 当前时间: {datetime.now()}")
                 return result
             except Exception as e:
                 # 如果获取失败，返回一个很早的时间，避免误判
@@ -593,16 +591,13 @@ try:
         shutdown_time = datetime.now() + timedelta(minutes=monitor_duration)
         # 获取程序启动时的最后输入时间作为基准
         baseline_last_input = get_last_input_time()
-        logger.debug(f"初始基准输入时间: {baseline_last_input}")
         # 获取初始鼠标位置
         baseline_mouse_pos = get_mouse_position()
-        logger.debug(f"初始鼠标位置: {baseline_mouse_pos}")
         
         # 等待一小段时间，确保基准时间准确
         time.sleep(1)
         # 重新获取基准时间，避免程序启动时的干扰
         baseline_last_input = get_last_input_time()
-        logger.debug(f"修正后的基准输入时间: {baseline_last_input}")
         
         while datetime.now() < shutdown_time:
             last_input = get_last_input_time()
@@ -612,13 +607,10 @@ try:
             # 只有当时间差超过一定阈值时才认为是真正的键盘活动
             time_diff = (last_input - baseline_last_input).total_seconds()
             keyboard_activity = time_diff > 5  # 提高阈值到5秒以避免误判
-            logger.debug(f"键盘活动检查 - 时间差: {time_diff}秒, 阈值: 5秒, 活动: {keyboard_activity}")
             
             # 检查是否有显著的鼠标移动
             mouse_activity = is_significant_mouse_movement(baseline_mouse_pos, current_mouse_pos, mouse_threshold)
             
-            # 调试信息：输出时间比较详情
-            logger.debug(f"最后输入时间: {last_input}, 基准时间: {baseline_last_input}, 键盘活动: {keyboard_activity}")
             
             # 增加额外的验证，避免误判
             if keyboard_activity:
@@ -628,7 +620,6 @@ try:
                 # 使用同样的阈值检查
                 confirmed_time_diff = (confirmed_last_input - baseline_last_input).total_seconds()
                 keyboard_activity = confirmed_time_diff > 5  # 使用相同的5秒阈值
-                logger.debug(f"确认的最后输入时间: {confirmed_last_input}, 时间差: {confirmed_time_diff}秒, 确认的键盘活动: {keyboard_activity}")
             
             # 如果检测到键盘输入或显著鼠标移动，则取消关机
             if keyboard_activity or mouse_activity:
@@ -636,7 +627,6 @@ try:
                     logger.info("检测到键盘输入活动，取消自动关机")
                     # 输出详细的时间差信息
                     time_diff = last_input - baseline_last_input
-                    logger.debug(f"键盘活动时间差: {time_diff.total_seconds()}秒")
                 elif mouse_activity:
                     logger.info("检测到显著鼠标移动，取消自动关机")
                 sys.exit(0)
@@ -650,7 +640,6 @@ try:
                 time.sleep(check_interval // 2)
                 mid_mouse_pos = get_mouse_position()
                 mid_mouse_activity = is_significant_mouse_movement(baseline_mouse_pos, mid_mouse_pos, mouse_threshold)
-                logger.debug(f"中间检查鼠标位置: {mid_mouse_pos}, 活动: {mid_mouse_activity}")
                 
                 if mid_mouse_activity:
                     logger.info("检测到显著鼠标移动，取消自动关机")
