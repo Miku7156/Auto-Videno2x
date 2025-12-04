@@ -1,6 +1,7 @@
 # Auto-Videno2x 视频质量增强工具
 
-## 项目简介
+## Auto-Videno2x (Windows版)
+
 Auto-Videno2x 是一款功能强大的自动化视频质量增强工具，能够扫描指定目录下的视频文件，根据文件名相似度自动分类，并使用 Video2X 进行分辨率提升和帧率增强处理。该工具特别适合批量处理电视剧、动漫等有序媒体文件集，并提供智能调度和资源管理功能。
 
 ## 核心功能
@@ -8,7 +9,7 @@ Auto-Videno2x 是一款功能强大的自动化视频质量增强工具，能够
 1. **智能视频扫描**：深度扫描指定目录，识别多种视频格式（MP4、MKV、AVI等）
 2. **自动元数据提取**：从文件名中识别季度(Sxx)和集数(Exx)信息
 3. **智能文件分组**：基于文件名相似度（Levenshtein距离算法）自动将相似文件分组
-4. **处理优先级排序**：根据文件大小和完整性自动计算处理优先级
+4. **处理优先级排序**：根据文件修改时间智能计算处理优先级，优先处理最新的剧集
 5. **分辨率增强**：使用libplacebo和anime4k-v4-a+a着色器提升视频分辨率
 6. **帧率增强**：使用RIFE算法将视频帧率提升2倍，使画面更加流畅
 7. **自动文件管理**：处理完成后自动将增强视频移至原目录并清理临时文件
@@ -44,28 +45,39 @@ Auto-Videno2x/
 [Logs]
 MaxLogLines = 6000     # 日志文件最大行数限制
 
+[Processing]
+EnableResolutionEnhancement = false  # 是否启用分辨率增强
+EnableFrameEnhancement = false       # 是否启用帧率增强
+
 [ResolutionEnhancement]
-ResolutionWidth = 2560 # 增强后的宽度
-ResolutionHeight = 1440 # 增强后的高度
+ResolutionWidth = 3840  # 增强后的宽度
+ResolutionHeight = 2160 # 增强后的高度
 Processor = libplacebo  # 分辨率增强处理器
 Shader = anime4k-v4-a+a # 使用的着色器
+Encoder = hevc_nvenc    # 编码器
+EncoderPreset = p7      # 编码预设
+EncoderCRF = 24         # 编码质量因子
 
 [FrameEnhancement]
-FrameMultiplier = 2    # 帧率倍增系数
-Processor = rife       # 帧率增强处理器
-RifeModel = rife-v4.6  # RIFE模型版本
+FrameMultiplier = 2     # 帧率倍增系数
+Processor = rife        # 帧率增强处理器
+RifeModel = rife-v4.6   # RIFE模型版本
+Encoder = hevc_nvenc    # 编码器
+EncoderPreset = p7      # 编码预设
+EncoderCRF = 26         # 编码质量因子
+Threads = 30            # 处理线程数
 
 [PATHS]
-LogDir = log           # 日志目录
-TmpDir = tmp           # 临时文件目录
-DataDir = data         # 数据存储目录
-ScanPath = C:\example  # 要扫描的视频目录
-Video2xPath = C:\path\to\video2x.exe # Video2X可执行文件路径
+LogDir = log            # 日志目录
+TmpDir = tmp            # 临时文件目录
+DataDir = data          # 数据存储目录
+ScanPath = Z:\          # 要扫描的视频目录
+Video2xPath = C:\App\Video2X Qt6\video2x.exe # Video2X可执行文件路径
 
 [Schedule]
-AllowedDays = 1-6      # 允许执行的星期天数范围（1-7，1表示周一，7表示周日，1-6表示周一到周六）
-GpuUsageThreshold = 80 # 允许执行的最大GPU占用度百分比
-AutoShutdown = false   # 任务完成后是否自动关机（true/false）
+AllowedDays = 1-7       # 允许执行的星期天数范围（1-7，1表示周一，7表示周日）
+GpuUsageThreshold = 50  # 允许执行的最大GPU占用度百分比
+AutoShutdown = false    # 任务完成后是否自动关机（true/false）
 ```
 
 ## 使用方法
@@ -88,7 +100,7 @@ AutoShutdown = false   # 任务完成后是否自动关机（true/false）
 增强后的视频文件将以如下格式命名并存放在原目录：
 ```
 [原文件名] [分辨率宽度]x[分辨率高度] fpsx[帧率倍数] Viden2x_HQ.[原扩展名]
-例如：Example_S01E01 2560x1440 fpsx2 Viden2x_HQ.mp4
+例如：Example_S01E01 3840x2160 fpsx2 Viden2x_HQ.mp4
 ```
 
 ## 处理状态
@@ -112,6 +124,18 @@ AutoShutdown = false   # 任务完成后是否自动关机（true/false）
 
 ### 自动关机功能
 任务完成后，程序可以根据配置自动关闭计算机，适合在夜间批量处理任务时使用。
+
+## 处理优先级排序逻辑
+
+Auto-Videno2x 使用一种独特的处理优先级排序算法，确保最新剧集得到优先处理：
+
+1. **文件分组**：首先根据文件名相似度将视频文件分为不同的分支（剧集组）
+2. **季度和集数识别**：从文件名中提取季度(Sxx)和集数(Exx)信息
+3. **时间排序**：在同一季度和集数组合中，按照文件修改时间排序
+4. **优先级计算**：统计每个分支中具有最早修改时间的文件数量
+5. **优先级分配**：按照这个数量进行排序，数量多的分支优先级更高（处理优先级数字更小）
+
+这种排序机制确保了连续剧集中最新的一集能够得到优先处理，即使它们可能分布在不同的文件格式中（如MP4和MKV）。
 
 ## 注意事项
 

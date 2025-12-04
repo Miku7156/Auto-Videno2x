@@ -1,16 +1,34 @@
+# -*- coding: utf-8 -*-
 import os
 import subprocess
 import configparser
 import sys
 import time
 import logging
-import json 
+import json
 from datetime import datetime, timedelta
 import re
-import shutil
 from collections import defaultdict
-import threading
-import time
+import signal
+from data_manager import DataManager
+import io
+
+# 确保标准输出和错误输出使用UTF-8编码
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+
+
+
+
+# 信号处理器
+def signal_handler(sig, frame):
+    print('\n接收到停止信号，正在停止程序...')
+    sys.exit(0)
+
+# 注册信号处理器
+signal.signal(signal.SIGINT, signal_handler)
             
 
 # 视频文件扩展名集合
@@ -36,7 +54,7 @@ def setup_logging():
 
     # 从配置文件读取日志行数限制
     config = configparser.ConfigParser()
-    config.read('config.ini')
+    config.read('config.ini', encoding='utf-8')
     max_log_lines = int(config.get('Logs', 'MaxLogLines', fallback=6000))
     if os.path.exists(log_file):
         with open(log_file, 'r', encoding='utf-8') as f:
@@ -45,18 +63,21 @@ def setup_logging():
             with open(log_file, 'w', encoding='utf-8') as f:
                 f.writelines(log_lines[-max_log_lines:])
 
+    # 设置控制台编码以正确显示中文
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.stream.reconfigure(encoding='utf-8')
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)  # 可选，调试用
+            console_handler
         ]
     )
 
 setup_logging()
 logger = logging.getLogger(__name__)
-
 # -------------------------------
 # 2. 基础路径 & 配置读取
 # -------------------------------
@@ -74,10 +95,20 @@ res_width = config.get('ResolutionEnhancement', 'ResolutionWidth')
 res_height = config.get('ResolutionEnhancement', 'ResolutionHeight')
 res_processor = config.get('ResolutionEnhancement', 'Processor')
 res_shader = config.get('ResolutionEnhancement', 'Shader')
+# 读取分辨率增强编码配置
+res_encoder = config.get('ResolutionEnhancement', 'Encoder', fallback='h264_nvenc')
+res_preset = config.get('ResolutionEnhancement', 'EncoderPreset', fallback='p7')
+res_crf = config.get('ResolutionEnhancement', 'EncoderCRF', fallback='24')
 # 读取帧率增强配置
 frame_multiplier = config.get('FrameEnhancement', 'FrameMultiplier')
 frame_processor = config.get('FrameEnhancement', 'Processor')
 rife_model = config.get('FrameEnhancement', 'RifeModel')
+# 读取帧率增强编码配置
+frame_encoder = config.get('FrameEnhancement', 'Encoder', fallback='h264_nvenc')
+frame_preset = config.get('FrameEnhancement', 'EncoderPreset', fallback='p7')
+frame_crf = config.get('FrameEnhancement', 'EncoderCRF', fallback='26')
+# 读取线程数配置
+threads = config.get('FrameEnhancement', 'Threads', fallback='100')
 tmp_dir = config.get('PATHS', 'TmpDir')
 tmp_dir = os.path.join(BASE_DIR, tmp_dir)
 os.makedirs(tmp_dir, exist_ok=True)
@@ -107,6 +138,9 @@ def sanitize_path_for_filename(path):
 sanitized_name = sanitize_path_for_filename(scan_path)
 json_filename = f"scan_result_{sanitized_name}.json"
 output_json_path = os.path.join(DATA_DIR, json_filename)
+
+# 初始化数据管理器
+data_manager = DataManager(output_json_path)
 
 # -------------------------------
 # 4. 扫描目录并记录日志
@@ -292,49 +326,90 @@ try:
             branches = new_branches
 
         # 2. 计算处理优先级
-        # 2.1 收集所有季度和集数组合
-        all_episodes = set()
-        for file in files:
-            if file["季度信息"] != "00" and file["集数信息"] != "00":
-                all_episodes.add((file["季度信息"], file["集数信息"]))
-
-        # 2.2 计算每个分支的文件大小总和
-        branch_sizes = defaultdict(int)
-        for branch_id, branch_files in enumerate(branches):
-            total_size = 0
-            seen_episodes = set()
-            for file in branch_files:
-                # 排除包含Viden2x_HQ的文件
-                if "Viden2x_HQ" in file["文件名带扩展名"]:
-                    continue
-                episode_key = (file["季度信息"], file["集数信息"])
-                # 只计算在所有分支中都存在的季度和集数，且每个集数只计算一次
-                if episode_key in all_episodes and episode_key not in seen_episodes:
-                    # 检查该季度和集数是否存在于所有分支
-                    exists_in_all = True
-                    for check_branch_id in range(len(branches)):
-                        if check_branch_id == branch_id:
-                            continue
-                        found = False
-                        for check_file in branches[check_branch_id]:
-                            if (check_file["季度信息"], check_file["集数信息"]) == episode_key:
-                                found = True
-                                break
-                        if not found:
-                            exists_in_all = False
-                            break
-                    if exists_in_all:
-                        total_size += file["文件大小 (字节)"]
-                        seen_episodes.add(episode_key)
-                    branch_sizes[branch_id] = total_size
-
-        # 2.3 按大小排序分支并分配优先级
-        # 创建分支ID到索引的映射，提高查找效率
-        branch_index_map = {id(branch): idx for idx, branch in enumerate(branches)}
+        # 2.3 按新的排序逻辑分配优先级
         # 过滤掉分支级为-1的分支
         filtered_branches = [branch for branch in branches if all(file["分支"] != -1 for file in branch)]
-        sorted_branches = sorted(filtered_branches, key=lambda x: branch_sizes[branch_index_map[id(x)]])
-        for priority, branch in enumerate(sorted_branches):
+        
+        def get_file_sort_key(file):
+            """获取文件排序键：按修改时间排序"""
+            try:
+                modify_time = datetime.strptime(file["文件修改时间"], '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                # 如果无法解析时间，使用当前时间
+                modify_time = datetime.now()
+            return modify_time
+        
+        # 新的排序逻辑：
+        # 1. 按季度和集数组合对所有分支中的文件分组
+        # 2. 对每组相同季度和集数的文件按修改时间排序
+        # 3. 统计每个分支中具有最早修改时间的文件数量
+        # 4. 按照这个数量进行排序，数量多的分支优先级更高
+        
+        # 按季度和集数组合对所有文件分组
+        # 只有在所有分支中都存在的季度和集数组合才会被纳入排序考虑
+        episode_groups = {}  # {(季度, 集数): [文件列表]}
+        
+        # 首先统计每个季度和集数组合出现在多少个分支中
+        episode_branch_counts = {}
+        branch_count = len(filtered_branches)
+        
+        for branch in filtered_branches:
+            # 使用集合来避免同一分支中重复的季度和集数组合被多次计算
+            branch_episode_keys = set()
+            for file in branch:
+                episode_key = (file["季度信息"], file["集数信息"])
+                branch_episode_keys.add(episode_key)
+            
+            # 增加每个季度和集数组合的分支计数
+            for episode_key in branch_episode_keys:
+                episode_branch_counts[episode_key] = episode_branch_counts.get(episode_key, 0) + 1
+        
+        # 只保留那些在所有分支中都存在的季度和集数组合
+        valid_episode_keys = {key for key, count in episode_branch_counts.items() if count == branch_count}
+        
+        # 对所有文件进行分组，但只保留有效的季度和集数组合
+        for branch in filtered_branches:
+            for file in branch:
+                episode_key = (file["季度信息"], file["集数信息"])
+                if episode_key in valid_episode_keys:
+                    if episode_key not in episode_groups:
+                        episode_groups[episode_key] = []
+                    episode_groups[episode_key].append(file)
+        
+        # 对每组相同季度和集数的文件按修改时间排序
+        for episode_key, files in episode_groups.items():
+            files.sort(key=get_file_sort_key)
+        
+        # 统计每个分支中具有最早修改时间的文件数量
+        # （即在各自季度和集数组合中时间最早的文件）
+        branch_early_file_counts = [0] * len(filtered_branches)
+        # 创建一个从文件路径到分支索引的映射，提高查找效率
+        file_to_branch_index = {}
+        for branch_idx, branch in enumerate(filtered_branches):
+            for file in branch:
+                file_to_branch_index[file["文件完整路径"]] = branch_idx
+                
+        # 对于每个episode group，只统计最早修改的那个文件所属的分支
+        for episode_key, files in episode_groups.items():
+            if files:  # 确保组中有文件
+                # files已经按修改时间排序，第一个就是最早修改的文件
+                earliest_file = files[0]
+                # 找到该文件所属的分支
+                branch_idx = file_to_branch_index.get(earliest_file["文件完整路径"])
+                if branch_idx is not None:
+                    branch_early_file_counts[branch_idx] += 1
+        
+        # 根据每个分支中早期文件的数量排序分支
+        # 数量多的分支优先级更高（处理优先级数字更小）
+        branch_indices = list(range(len(filtered_branches)))
+        # 按早期文件数量降序排列（使用负数实现降序）
+        sorted_indices = sorted(branch_indices, key=lambda i: -branch_early_file_counts[i])
+        
+        # 根据排序结果分配处理优先级，确保同一分支内的文件具有相同的优先级
+        # 修改优先级分配逻辑，使早期文件数量多的分支优先级数字更小（优先级更高）
+        # 优先级从0开始分配，数值越小优先级越高
+        for priority, branch_idx in enumerate(sorted_indices):
+            branch = filtered_branches[branch_idx]
             for file in branch:
                 file["处理优先级"] = priority
 
@@ -344,7 +419,7 @@ try:
     if os.path.exists(output_json_path):
         try:
             with open(output_json_path, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
+                old_data = data_manager.load_data()
             # 过滤旧数据中实际文件不存在的条目
             old_data = [file for file in old_data if os.path.exists(file['文件完整路径'])]
             # 创建旧数据的路径到文件信息的映射（统一转为小写路径，避免大小写问题）
@@ -392,6 +467,8 @@ try:
     logger.info(f"筛选出 {filtered_count} 个符合条件的文件:")
     for file_path in filtered_files:
         logger.info(f"- {file_path}")
+    # 保存数据
+    data_manager.save_data(file_data_list)
     
     # 读取分辨率增强倍数配置
     res_multiplier = config.get('Video', 'res_multiplier', fallback='2')
@@ -404,9 +481,7 @@ try:
     if not (start_day <= current_day <= end_day):
         logger.info(f"当前星期 {current_day} 不在允许的执行时间范围 {allowed_days} 内，保存数据并退出程序")
         # 保存数据
-        with open(output_json_path, 'w', encoding='utf-8') as f:
-            json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-        logger.info("💾 结果已保存到: %s", output_json_path)
+        data_manager.save_data(file_data_list)
         sys.exit(0)
     
     # 检查GPU占用度
@@ -422,192 +497,170 @@ try:
         if gpu_usage > gpu_threshold:
             logger.info(f"GPU占用度 {gpu_usage}% 超过阈值 {gpu_threshold}%，保存数据并退出程序")
             # 保存数据
-            with open(output_json_path, 'w', encoding='utf-8') as f:
-                json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-            logger.info("💾 结果已保存到: %s", output_json_path)
+            data_manager.save_data(file_data_list)
             sys.exit(0)
     except subprocess.CalledProcessError as e:
         logger.warning(f"获取GPU使用率失败: {e}，将继续执行程序")
     except (ValueError, Exception) as e:
         logger.warning(f"GPU检查异常: {e}，将继续执行程序")
 
-    #  进行画面增强处理
-    for file in file_data_list:
-        if file.get("处理步骤") == 1:
-            input_path = file["文件完整路径"]
-            filename = os.path.basename(input_path)
-            output_path = os.path.join(tmp_dir, filename)
-            logger.info(f"开始增强画面: {input_path}")
-            # 显示加载动画
-            def loading_animation(stop_event):
-                while not stop_event.is_set():
-                    for char in '|/-\ ':
-                        print(f'\r正在增强画面中... {char}', end='', flush=True)
-                        time.sleep(0.1)
-                print('\r增强画面完成!        ', flush=True)
-            
-            stop_event = threading.Event()
-            loading_thread = threading.Thread(target=loading_animation, args=(stop_event,))
-            loading_thread.start()
-            try:
-                start_time = time.time()
-                subprocess.run([
-                    video2x_path,
-                    '-i', input_path,
-                    '-o', output_path,
-                    '-w', res_width,
-                    '-h', res_height,
-                    '-p', res_processor,
-                    '--libplacebo-shader', res_shader
-                ], capture_output=True, text=True)
-                end_time = time.time()
-                duration = end_time - start_time
-                logger.info(f"画面增强完成:{output_path},耗时: {duration:.2f}秒")
-                file['处理步骤'] = 2  # 标记为已增强
-                #保存数据
-                with open(output_json_path, 'w', encoding='utf-8') as f:
-                    json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-                logger.info("💾 结果已保存到: %s", output_json_path)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"处理文件 {input_path} 失败: {e}")
-            finally:
-                stop_event.set()
-                loading_thread.join()
 
-        # 帧率增强处理：处理步骤=2的文件
-        if file.get('处理步骤') == 2:
-            input_filename = os.path.basename(file['文件完整路径'])
-            input_path = os.path.join(tmp_dir, input_filename)
-            
-            # 检查临时文件夹中是否存在已增强的文件
-            if not os.path.exists(input_path):
-                logger.warning(f"临时文件不存在，跳过帧率增强: {input_path}")
-                continue
-            
-            # 构建新文件名
-            base_name, ext = os.path.splitext(input_filename)
-            new_filename = f"{base_name} {res_width}x{res_height} fpsx{frame_multiplier} Viden2x_HQ{ext}"
-            output_path = os.path.join(tmp_dir, new_filename)
-            
-            try:
-                logger.info(f"开始帧率增强: {input_path}")
-                start_time = time.time()
-                # 显示加载动画
-                def loading_animation(stop_event):
-                    while not stop_event.is_set():
-                        for char in '|/-\ ':
-                            print(f'\r正在增强帧率中... {char}', end='', flush=True)
-                            time.sleep(0.1)
-                    print('\r增强帧率完成!        ', flush=True)
-                stop_event = threading.Event()
-                loading_thread = threading.Thread(target=loading_animation, args=(stop_event,))
-                loading_thread.start()
-                # 执行video2x帧率增强命令
-                # 添加详细日志和错误捕获
-                result = subprocess.run([
-                    video2x_path,
-                    'upscale',  # 显式指定upscale命令
-                    '-i', input_path,
-                    '-o', output_path,
-                    '-m', frame_multiplier,
-                    '-p', frame_processor,
-                    '--rife-model', rife_model,
-                ], capture_output=True, text=True)
-                # 处理输出内容，区分GPU信息和错误
-                stderr_lines = result.stderr.splitlines()
-                gpu_lines = [line for line in stderr_lines if '[0 NVIDIA GeForce' in line]
-                non_gpu_lines = [line for line in stderr_lines if '[0 NVIDIA GeForce' not in line and line.strip()]
-                # 检查命令执行结果
-                if result.returncode == 0:
-                    # 命令成功执行
-                    if non_gpu_lines:
-                        logger.warning(f"帧率增强成功但存在输出: {chr(10).join(non_gpu_lines)}")
-                    # 计算处理时间
-                    end_time = time.time()
-                    stop_event.set()
-                    loading_thread.join()
-                    duration = end_time - start_time
-                    logger.info(f"帧率增强完成:{output_path},耗时: {duration:.2f}秒")
-                    file['处理步骤'] = 3    #标记为已执行完全部处理
-                    # 验证输出文件完整性
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                        logger.info(f"帧率增强文件验证成功: {output_path}")
-                        # 将文件移动到原文件目录
-                        original_dir = os.path.dirname(file['文件完整路径'])
-                        target_path = os.path.join(original_dir, new_filename)
-                        try:
-                            os.makedirs(original_dir, exist_ok=True)
-                            shutil.move(output_path, target_path)
-                            logger.info(f"帧率增强文件已移动至: {target_path}")
-                            # 更新文件记录路径和处理状态
-                            file['处理步骤'] = 3  # 标记为已完成所有处理
-                            # 清理临时画面增强文件
-                            if os.path.exists(input_path):
-                                os.remove(input_path)
-                                logger.info(f"已清理临时画面增强文件: {input_path}")
-                        except Exception as e:
-                            logger.error(f"文件移动或清理失败: {str(e)}")
-                    else:
-                        logger.error(f"帧率增强文件验证失败: {output_path} 不存在或为空")
-                        file['处理步骤'] = 2  # 重置处理步骤以便重试
+    # 移除了系统资源获取函数get_system_resources
+    # 因为现在改为直接处理方式，不需要检查系统资源
+
+
+    # 移除了资源检查和多进程启动函数check_resource_and_launch
+    # 现在直接处理视频，无需检查系统资源和进程数量
+
+    # 直接遍历处理每个符合条件的文件（替代原来的多进程方式）
+    processed_count = 0
+    
+    try:
+        for file in file_data_list:
+            if file.get("处理步骤") == 1 or file.get("处理步骤") == 2:
+                # 直接调用video_processor.py中的video_processorn函数处理文件
+                # 导入video_processor模块并调用video_processorn函数
+                import video_processor
+                success = video_processor.video_processorn(
+                    file, tmp_dir, video2x_path, res_width, res_height, res_processor,
+                    res_shader, res_encoder, res_preset, res_crf, frame_multiplier,
+                    frame_processor, rife_model, frame_encoder, frame_preset, frame_crf,
+                    threads)
+                if success:
+                    logger.info(f"成功处理文件: {file.get('文件名带扩展名', '未知文件')}")
                 else:
-                    # 命令返回非零退出码
-                    if not non_gpu_lines and gpu_lines:
-                        # 仅包含GPU信息，视为成功
-                        # 计算处理时间
-                        end_time = time.time()
-                        duration = end_time - start_time
-                        logger.info(f"帧率增强完成:{output_path},耗时: {duration:.2f}秒")
-                        file['处理步骤'] = 3   #标记为已执行完全部处理
-                        # 验证输出文件完整性
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                            logger.info(f"帧率增强文件验证成功: {output_path}")
-                            # 将文件移动到原文件目录
-                            original_dir = os.path.dirname(file['文件完整路径'])
-                            target_path = os.path.join(original_dir, new_filename)
-                            try:
-                                os.makedirs(original_dir, exist_ok=True)
-                                shutil.move(output_path, target_path)
-                                logger.info(f"帧率增强文件已移动至: {target_path}")
-                                # 更新文件记录路径和处理状态
-                                file['处理步骤'] = 3  # 标记为已完成所有处理
-                                # 清理临时画面增强文件
-                                if os.path.exists(input_path):
-                                    os.remove(input_path)
-                                    logger.info(f"已清理临时画面增强文件: {input_path}")
-                            except Exception as e:
-                                logger.error(f"文件移动或清理失败: {str(e)}")
-                        else:
-                            logger.error(f"帧率增强文件验证失败: {output_path} 不存在或为空")
-                            file['处理步骤'] = 2  # 重置处理步骤以便重试
-                    else:
-                        # 真正的错误，记录并抛出异常
-                        logger.error(f"帧率增强失败: 退出代码 {result.returncode}, 命令: {result.args}")
-                        if result.stdout:
-                            logger.error(f"标准输出: {result.stdout}")
-                        if non_gpu_lines:
-                            logger.error(f"错误输出: {chr(10).join(non_gpu_lines)}")
-                        else:
-                            logger.error(f"错误输出: {result.stderr}")
-                        raise subprocess.CalledProcessError(result.returncode, result.args)
-            except subprocess.CalledProcessError as e:
-                logger.error(f"帧率增强失败: 退出代码 {e.returncode}, 命令: {e.cmd}")
-                logger.error(f"标准输出: {getattr(e, 'stdout', '未捕获')}")
-                logger.error(f"错误输出: {getattr(e, 'stderr', '未捕获')}")
-            except Exception as e:
-                logger.error(f"帧率增强发生异常: {str(e)}")
+                    logger.error(f"处理文件失败: {file.get('文件名带扩展名', '未知文件')}")
+                processed_count += 1
+    except Exception as e:
+        logger.error(f"处理文件时出错: {e}")
+    
+    
+    
+    logger.info(f"总共处理了 {processed_count} 个文件")
+    # 由于改为直接处理方式，不再需要等待多进程任务完成
+    # 所有视频文件已经在上面的循环中处理完毕
+    logger.info("所有视频文件处理完成")
 
-            finally:
-                stop_event.set()
-                loading_thread.join()
-    #保存数据
-    with open(output_json_path, 'w', encoding='utf-8') as f:
-        json.dump(file_data_list, f, ensure_ascii=False, indent=2)
-    logger.info("💾 结果已保存到: %s", output_json_path)
     # 检查是否启用自动关机
     auto_shutdown = config.getboolean('Schedule', 'AutoShutdown', fallback=False)
     if auto_shutdown:
-        logger.info("所有任务已完成，准备关闭电脑...")
+        # 设置日志级别为DEBUG以便查看调试信息
+        logging.getLogger().setLevel(logging.DEBUG)
+        try:
+            import win32api
+            import win32con
+            from datetime import datetime, timedelta
+        except ImportError:
+            logger.error("缺少pywin32库，无法监控输入活动，将直接关机")
+            subprocess.run(["powershell", "Stop-Computer", "-Force"])
+            sys.exit(0)
+
+        def get_last_input_time():
+            """获取最后一次输入的时间"""
+            try:
+                last_input_time = win32api.GetLastInputInfo()
+                elapsed_seconds = (win32api.GetTickCount() - last_input_time) / 1000
+                result = datetime.now() - timedelta(seconds=elapsed_seconds)
+                # 调试信息：输出获取到的输入时间
+                logger.debug(f"获取到最后输入时间: {result}, 当前时间: {datetime.now()}")
+                return result
+            except Exception as e:
+                # 如果获取失败，返回一个很早的时间，避免误判
+                logger.debug(f"获取最后输入时间失败: {e}")
+                return datetime.now() - timedelta(hours=1)
+
+        def get_mouse_position():
+            """获取当前鼠标位置"""
+            try:
+                return win32api.GetCursorPos()
+            except:
+                return (0, 0)
+
+        def is_significant_mouse_movement(last_pos, current_pos, threshold=50):
+            """判断鼠标移动是否显著（超过阈值）"""
+            if last_pos is None:
+                return False
+            dx = current_pos[0] - last_pos[0]
+            dy = current_pos[1] - last_pos[1]
+            distance = (dx*dx + dy*dy) ** 0.5
+            return distance >= threshold
+
+        monitor_duration = 15  # 监控时长(分钟)
+        check_interval = 60   # 检查间隔(秒)
+        mouse_threshold = 50   # 鼠标移动阈值(像素)
+        logger.info(f"所有任务已完成，将在{monitor_duration}分钟后关闭电脑，期间检测到输入活动将取消关机")
+
+        shutdown_time = datetime.now() + timedelta(minutes=monitor_duration)
+        # 获取程序启动时的最后输入时间作为基准
+        baseline_last_input = get_last_input_time()
+        logger.debug(f"初始基准输入时间: {baseline_last_input}")
+        # 获取初始鼠标位置
+        baseline_mouse_pos = get_mouse_position()
+        logger.debug(f"初始鼠标位置: {baseline_mouse_pos}")
+        
+        # 等待一小段时间，确保基准时间准确
+        time.sleep(1)
+        # 重新获取基准时间，避免程序启动时的干扰
+        baseline_last_input = get_last_input_time()
+        logger.debug(f"修正后的基准输入时间: {baseline_last_input}")
+        
+        while datetime.now() < shutdown_time:
+            last_input = get_last_input_time()
+            current_mouse_pos = get_mouse_position()
+            
+            # 检查是否有键盘输入活动
+            # 只有当时间差超过一定阈值时才认为是真正的键盘活动
+            time_diff = (last_input - baseline_last_input).total_seconds()
+            keyboard_activity = time_diff > 5  # 提高阈值到5秒以避免误判
+            logger.debug(f"键盘活动检查 - 时间差: {time_diff}秒, 阈值: 5秒, 活动: {keyboard_activity}")
+            
+            # 检查是否有显著的鼠标移动
+            mouse_activity = is_significant_mouse_movement(baseline_mouse_pos, current_mouse_pos, mouse_threshold)
+            
+            # 调试信息：输出时间比较详情
+            logger.debug(f"最后输入时间: {last_input}, 基准时间: {baseline_last_input}, 键盘活动: {keyboard_activity}")
+            
+            # 增加额外的验证，避免误判
+            if keyboard_activity:
+                # 等待短暂时间再次确认
+                time.sleep(0.1)
+                confirmed_last_input = get_last_input_time()
+                # 使用同样的阈值检查
+                confirmed_time_diff = (confirmed_last_input - baseline_last_input).total_seconds()
+                keyboard_activity = confirmed_time_diff > 5  # 使用相同的5秒阈值
+                logger.debug(f"确认的最后输入时间: {confirmed_last_input}, 时间差: {confirmed_time_diff}秒, 确认的键盘活动: {keyboard_activity}")
+            
+            # 如果检测到键盘输入或显著鼠标移动，则取消关机
+            if keyboard_activity or mouse_activity:
+                if keyboard_activity:
+                    logger.info("检测到键盘输入活动，取消自动关机")
+                    # 输出详细的时间差信息
+                    time_diff = last_input - baseline_last_input
+                    logger.debug(f"键盘活动时间差: {time_diff.total_seconds()}秒")
+                elif mouse_activity:
+                    logger.info("检测到显著鼠标移动，取消自动关机")
+                sys.exit(0)
+                
+            remaining = (shutdown_time - datetime.now()).seconds // 60
+            logger.info(f"无显著输入活动，剩余{remaining}分钟后关机...")
+            
+            # 在长时间等待前再检查一次鼠标位置，避免累积误差
+            if remaining > 0 and check_interval > 30:
+                # 如果检查间隔较长，在中间再检查一次
+                time.sleep(check_interval // 2)
+                mid_mouse_pos = get_mouse_position()
+                mid_mouse_activity = is_significant_mouse_movement(baseline_mouse_pos, mid_mouse_pos, mouse_threshold)
+                logger.debug(f"中间检查鼠标位置: {mid_mouse_pos}, 活动: {mid_mouse_activity}")
+                
+                if mid_mouse_activity:
+                    logger.info("检测到显著鼠标移动，取消自动关机")
+                    sys.exit(0)
+                
+                time.sleep(check_interval - check_interval // 2)
+            else:
+                time.sleep(check_interval)
+
+        logger.info("监控时间结束，无显著输入活动，准备关闭电脑...")
         subprocess.run(["powershell", "Stop-Computer", "-Force"])
         sys.exit(0)
     else:
