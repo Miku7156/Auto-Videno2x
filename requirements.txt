@@ -1,4 +1,4 @@
-# Auto-Videno2x 依赖文件
+# Auto-Video2x 依赖文件
 # Python版本要求: 3.6及以上
 
 # 本项目主要使用Python标准库，无需安装额外的第三方依赖
